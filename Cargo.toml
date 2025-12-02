@@ -1,0 +1,12 @@
+[package]
+name = "onebrc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.178"
+
+[profile.release]
+lto = "fat"
+debug = true
+codegen-units = 1
