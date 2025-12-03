@@ -14,15 +14,18 @@ fn reading_from_str(bytes: &[u8]) -> i16 {
         }
 
         4 => {
+            let first = bytes[0]; // maybe - or maybe digit
+            let third = bytes[2]; // always .
+
+            // high nibble of both - and . is 4, so if both are present then
+            // negative will be true.
+            let negative = ((first ^ third) >> 6) == 0;
+
             let mut reading = (bytes[len - 1] - b'0') as i16;
             reading += (bytes[len - 3] - b'0') as i16 * 10;
-            
-            if bytes[0] == b'-' {
-                -1 * reading
-            } else {
-                reading += (bytes[0] - b'0') as i16 * 100;
-                reading
-            }
+
+            (negative as i16) * (-1 * reading) +
+                (!negative as i16) * (bytes[0] - b'0') as i16 * 100
         }
 
         5 => {
