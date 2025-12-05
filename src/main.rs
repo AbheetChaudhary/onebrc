@@ -242,44 +242,62 @@ fn main() {
 
     let file_buffer = mmap_read(&file);
 
-    let read_buffer = file_buffer.buffer;
+    let read_buffer_ptr: *const u8 = file_buffer.buffer.as_ptr();
+    let read_buffer_size = file_buffer.buffer.len();
 
     let mut map: HashMap<CityName, Record, CityHashBuilder> =
         HashMap::with_capacity_and_hasher(10000, CityHashBuilder);
 
-    let mut newline_idx = 0;
-    let mut semicolon_idx = 0;
     let mut begin_idx = 0;
 
     loop {
-        if read_buffer[semicolon_idx] != b';' {
-            semicolon_idx += 1;
-            continue;
-        }
+        let semicolon_ptr = unsafe {
+            libc::memchr(
+                read_buffer_ptr.add(begin_idx) as *const _,
+                b';' as _,
+                read_buffer_size - begin_idx,
+            )
+        } as *const u8;
 
-        newline_idx = semicolon_idx + 1;
+        let city_name_len: usize = unsafe {
+            semicolon_ptr.addr() - read_buffer_ptr.add(begin_idx).addr()
+        };
 
-        loop {
-            if read_buffer[newline_idx] != b'\n' {
-                newline_idx += 1;
-                continue;
-            }
+        let newline_ptr = unsafe {
+            libc::memchr(
+                semicolon_ptr.add(1) as *const _,
+                b'\n' as _,
+                read_buffer_size - begin_idx - city_name_len,
+            )
+        } as *const u8;
 
-            break;
-        }
+        let temperature_bytes_len =
+            newline_ptr.addr() - semicolon_ptr.addr() - 1;
 
-        let city = &read_buffer[begin_idx..semicolon_idx];
-        let temperature_bytes = &read_buffer[semicolon_idx + 1..newline_idx];
+        let city = unsafe {
+            std::slice::from_raw_parts(
+                read_buffer_ptr.add(begin_idx),
+                city_name_len,
+            )
+        };
+
+        let temperature_bytes = unsafe {
+            std::slice::from_raw_parts(
+                semicolon_ptr.add(1),
+                temperature_bytes_len
+            )
+        };
 
         let temperature = reading_from_str(temperature_bytes);
 
         map.entry(CityName::from(city)).and_modify(|e| e.update(temperature))
             .or_insert(Record::new(temperature));
 
-        begin_idx = newline_idx + 1;
-        semicolon_idx = newline_idx + 1;
+        begin_idx = unsafe {
+            newline_ptr.add(1).addr() - read_buffer_ptr.addr()
+        } as usize;
 
-        if semicolon_idx == read_buffer.len() {
+        if begin_idx == read_buffer_size {
             break;
         }
     }
@@ -304,8 +322,6 @@ fn main() {
     }
 
     _ = writer.flush();
-
-    println!("read: {:.6}", read_elapsed.as_secs_f64());
 }
 
 use std::os::fd::{AsFd, AsRawFd};
