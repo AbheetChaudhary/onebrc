@@ -43,6 +43,31 @@ fn reading_from_str(bytes: &[u8]) -> i16 {
     }
 }
 
+struct Record {
+    min:   i16, // current minimum scaled temperature
+    max:   i16, // current maximum scaled temperature
+    count: u32, // number of readings for this city
+    sum:   i64, // sum of all the scaled temperature readings
+}
+
+impl Record {
+    fn new(val: i16) -> Self {
+        Record {
+            min: val,
+            max: val,
+            count: 1,
+            sum: val as _,
+        }
+    }
+
+    fn update(&mut self, val: i16) {
+        self.min = self.min.min(val);
+        self.max = self.max.max(val);
+        self.count += 1;
+        self.sum += val as i64;
+    }
+}
+
 fn main() {
     let args = std::env::args().collect::<Vec<String>>();
 
@@ -60,7 +85,7 @@ fn main() {
     let mut read_buffer: Vec<u8> = Vec::with_capacity(128 * 1024 * 1024);
     _ = file.read_to_end(&mut read_buffer);
 
-    let mut map: HashMap<&[u8], Vec<i16>> = HashMap::with_capacity(10000);
+    let mut map: HashMap<&[u8], Record> = HashMap::with_capacity(10000);
 
     for line in read_buffer.split(|x| *x == b'\n') {
         if line.is_empty() { continue; }
@@ -74,49 +99,28 @@ fn main() {
         // let reading_scaled = reading_from_str_unchecked(reading.as_bytes());
 
         match map.get_mut(city) {
-            Some(v) => v.push(temperature),
+            Some(v) => v.update(temperature),
             None => {
-                let mut v = Vec::with_capacity(128);
-                v.push(temperature);
-                map.insert(city, v);
+                map.insert(city, Record::new(temperature));
             }
         }
     }
 
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
-    let data_btree: BTreeMap<&[u8], &Vec<i16>> =
-        BTreeMap::from_iter(map.iter().map(|(city, temperature)| {
-            (*city, temperature)
+    let data_btree: BTreeMap<&[u8], &Record> =
+        BTreeMap::from_iter(map.iter().map(|(city, record)| {
+            (*city, record)
         }));
 
-    for (city, readings) in &data_btree {
-        let len = readings.len();
-
-        let mut min = i16::MAX;
-        let mut max = i16::MIN;
-
-        let mut sum: i64 = 0;
-
-        for r in *readings {
-            min = min.min(*r);
-
-            max = max.max(*r);
-
-            sum += *r as i64;
-        }
-
-        let min = min as f32 / 10.0;
-        let max = max as f32 / 10.0;
-        let avg = sum as f64 / len as f64 / 10.0;
-
+    for (city, entry) in &data_btree {
         _ = writer.write(
             format!(
                 "{}: {:.1}, {:.1}, {:.1}\n",
                 unsafe { str::from_utf8_unchecked(city) },
-                min,
-                max,
-                avg,
+                entry.min as f32 / 10.0,
+                entry.max as f32 / 10.0,
+                entry.sum as f64 / entry.count as f64 / 10.0,
             ).as_bytes()
         );
     }
