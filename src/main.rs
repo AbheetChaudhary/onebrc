@@ -1,7 +1,12 @@
-#![allow(unused, dead_code)]
-
-use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufWriter, Write};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
+use std::io::{
+    BufWriter,
+    Write,
+    Read,
+};
 
 fn reading_from_str(bytes: &[u8]) -> i16 {
     let len = bytes.len();
@@ -24,7 +29,7 @@ fn reading_from_str(bytes: &[u8]) -> i16 {
             let mut reading = (bytes[len - 1] - b'0') as i16;
             reading += (bytes[len - 3] - b'0') as i16 * 10;
 
-            (negative as i16) * (-1 * reading) +
+            (negative as i16) * (-reading) +
                 (!negative as i16) * (bytes[0] - b'0') as i16 * 100
         }
 
@@ -32,7 +37,7 @@ fn reading_from_str(bytes: &[u8]) -> i16 {
             let mut reading = (bytes[len - 1] - b'0') as i16;
             reading += (bytes[len - 3] - b'0') as i16 * 10;
             reading += (bytes[len - 4] - b'0') as i16 * 100;
-            -1 * reading
+            -reading
         }
         _ => unreachable!(),
     }
@@ -48,35 +53,42 @@ fn main() {
 
     let filename = &args[1];
 
-    let file = std::fs::File::open(filename).unwrap();
+    let mut file = std::fs::File::open(filename).unwrap();
 
-    let reader = std::io::BufReader::new(file);
+    // let reader = std::io::BufReader::new(file);
 
-    let mut data: HashMap<Vec<u8>, Vec<i16>> = HashMap::with_capacity(10000);
+    let mut read_buffer: Vec<u8> = Vec::with_capacity(128 * 1024 * 1024);
+    _ = file.read_to_end(&mut read_buffer);
 
-    for line in reader.split(b'\n') {
-        let line = line.unwrap();
+    let mut map: HashMap<&[u8], Vec<i16>> = HashMap::with_capacity(10000);
+
+    for line in read_buffer.split(|x| *x == b'\n') {
+        if line.is_empty() { continue; }
+
         let semicolon_idx = line.iter().position(|x| x == &b';').unwrap();
 
         let city = &line[..semicolon_idx];
-        let reading: &[u8] = &line[semicolon_idx + 1..line.len()];
+        let temperature_bytes: &[u8] = &line[semicolon_idx + 1..line.len()];
 
-        let reading_scaled = reading_from_str(reading);
+        let temperature = reading_from_str(temperature_bytes);
         // let reading_scaled = reading_from_str_unchecked(reading.as_bytes());
 
-        match data.get_mut(city) {
-            Some(v) => v.push(reading_scaled),
+        match map.get_mut(city) {
+            Some(v) => v.push(temperature),
             None => {
                 let mut v = Vec::with_capacity(128);
-                v.push(reading_scaled);
-                data.insert(city.to_owned(), v);
+                v.push(temperature);
+                map.insert(city, v);
             }
         }
     }
 
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
-    let data_btree: BTreeMap<&Vec<u8>, &Vec<i16>> = BTreeMap::from_iter(data.iter());
+    let data_btree: BTreeMap<&[u8], &Vec<i16>> =
+        BTreeMap::from_iter(map.iter().map(|(city, temperature)| {
+            (*city, temperature)
+        }));
 
     for (city, readings) in &data_btree {
         let len = readings.len();
@@ -98,7 +110,7 @@ fn main() {
         let max = max as f32 / 10.0;
         let avg = sum as f64 / len as f64 / 10.0;
 
-        writer.write(
+        _ = writer.write(
             format!(
                 "{}: {:.1}, {:.1}, {:.1}\n",
                 unsafe { str::from_utf8_unchecked(city) },
