@@ -10,7 +10,10 @@ about creating the measurements.txt file.
 
 ## Status
 Naive implementation: ~7min30sec
-After some optimizations: 1 Billion rows in ~60seconds
+
+After some optimizations: 1 Billion rows in ~60seconds (single threaded)
+
+On a laptop with Intel i5-1035g1 @ 2.2GHz.
 
 ## TODO
 - better SIMD

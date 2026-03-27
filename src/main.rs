@@ -1,12 +1,79 @@
 #![feature(allocator_api)]
 
-mod alloc;
-use alloc::CityAllocator;
-
 use std::alloc::{Allocator, Layout};
 use std::cell::LazyCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
+
+use std::hash::{Hasher, Hash};
+
+mod alloc {
+    use std::alloc::{Allocator, Layout, AllocError};
+    use std::ptr::NonNull;
+    use std::cell::Cell;
+
+    pub struct CityAllocator {
+        arena: NonNull<u8>,
+        next: Cell<NonNull<u8>>,
+    }
+
+    // Max size (in bytes) to store all the city names.
+    const MAX_SIZE: usize = 100 * 10_000;
+
+    impl CityAllocator {
+        pub fn new() -> Self {
+            let buffer = Box::into_raw(Box::new([0u8; MAX_SIZE]));
+
+            let ptr = NonNull::new(buffer.cast::<u8>()).unwrap();
+
+            Self {
+                arena: ptr,
+                next: Cell::new(ptr),
+            }
+        }
+    }
+
+    impl Drop for CityAllocator {
+        fn drop(&mut self) {
+            let mut ptr = self.arena.cast::<[u8; MAX_SIZE]>();
+
+            // Deallocate the box.
+            _ = unsafe { Box::from_raw(ptr.as_mut()) };
+        }
+    }
+
+    unsafe impl Allocator for CityAllocator {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            if layout.size() > 100 {
+                return Err(AllocError);
+            }
+
+            if self.next.get().addr().get() + layout.size() >
+                self.arena.addr().get() + MAX_SIZE {
+                return Err(AllocError);
+            }
+
+            let ptr = self.next.get();
+
+            // bump the next pointer.
+            self.next.set(unsafe { ptr.add(layout.size()) });
+
+            Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+        }
+
+        unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+            // nop
+        }
+    }
+}
+
+use alloc::CityAllocator;
+
+thread_local! {
+    static CITY_ALLOCATOR: LazyCell<CityAllocator> = LazyCell::new(|| {
+        CityAllocator::new()
+    });
+}
 
 fn reading_from_str(bytes: &[u8]) -> i16 {
     let len = bytes.len();
@@ -69,13 +136,6 @@ impl Record {
     }
 }
 
-
-thread_local! {
-    static CITY_ALLOCATOR: LazyCell<CityAllocator> = LazyCell::new(|| {
-        CityAllocator::new()
-    });
-}
-
 struct HashBuilder;
 
 impl std::hash::BuildHasher for HashBuilder {
@@ -105,11 +165,9 @@ impl std::hash::Hasher for FNV1Hasher {
     }
 }
 
-#[repr(transparent)]
-#[derive(Hash, PartialEq, Eq)]
 struct City {
-    name: Vec<u8>, // TODO: it does not need to be vector, could be something
-                   // smaller.
+    ptr: *const u8,
+    len: usize,
 }
 
 impl City {
@@ -122,57 +180,51 @@ impl City {
         let layout = Layout::array::<u8>(len).unwrap();
 
         // Allocate memory to hold the city name.
-        let mut ptr = CITY_ALLOCATOR.with(|city_allocator| {
+        let ptr = CITY_ALLOCATOR.with(|city_allocator| {
             city_allocator.allocate(layout)
         }).unwrap().cast::<u8>();
 
         // Copy from disk to newly allocated memory.
         unsafe { ptr.as_ptr().copy_from_nonoverlapping(name.as_ptr(), len); }
 
-        let vec = unsafe {
-            Vec::from_raw_parts(
-                ptr.as_mut(),
-                len,
-                len,
-            )
-        };
-
         Self {
-            name: vec,
+            ptr: ptr.as_ptr() as *const _,
+            len,
         }
     }
 }
 
-impl Drop for City {
-    fn drop(&mut self) {
-        // The vector's memory comes from CityAllocator which is a bump
-        // allocator, so do not try to drop it.
-        std::mem::forget(std::mem::replace(&mut self.name, Vec::default()));
+impl std::ops::Deref for City {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
+
+impl Hash for City {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (&self[..]).hash(state);
+    }
+}
+
+impl PartialEq for City {
+    fn eq(&self, other: &Self) -> bool {
+        &self[..] == &other[..]
+    }
+}
+
+impl Eq for City {}
 
 impl std::borrow::Borrow<[u8]> for City {
     fn borrow(&self) -> &[u8] {
-        self.name.as_slice()
+        &self[..]
     }
 }
 
-fn main() {
-    let args = std::env::args().collect::<Vec<String>>();
-
-    if args.len() != 2 {
-        eprintln!("usage: {} <measurements.txt>", &args[0]);
-        std::process::exit(-1);
-    }
-
-    let filename = &args[1];
-
-    let file = std::fs::File::open(filename).unwrap();
-
-    let file_buffer = mmap_read(&file);
-
-    let read_buffer_ptr: *const u8 = file_buffer.buffer.as_ptr();
-    let read_buffer_size = file_buffer.buffer.len();
+fn parse(read_buffer: &[u8]) -> HashMap<City, Record, HashBuilder> {
+    let read_buffer_ptr: *const u8 = read_buffer.as_ptr();
+    let read_buffer_size = read_buffer.len();
 
     let mut map: HashMap<City, Record, HashBuilder> =
         HashMap::with_capacity_and_hasher(10000, HashBuilder);
@@ -236,11 +288,15 @@ fn main() {
         }
     }
 
+    map
+}
+
+fn print_sorted(map: &HashMap<City, Record, HashBuilder>) {
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
     let data_btree: BTreeMap<&[u8], &Record> =
         BTreeMap::from_iter(map.iter().map(|(city, record)| {
-            (city.name.as_slice(), record)
+            (&city[..], record)
         }));
 
     for (city, entry) in &data_btree {
@@ -310,3 +366,23 @@ fn mmap_read<'a>(file: &'a std::fs::File) -> FileBuffer<'a> {
         buffer,
     }
 }
+
+fn main() {
+    let args = std::env::args().collect::<Vec<String>>();
+
+    if args.len() != 2 {
+        eprintln!("usage: {} <measurements.txt>", &args[0]);
+        std::process::exit(-1);
+    }
+
+    let filename = &args[1];
+
+    let file = std::fs::File::open(filename).unwrap();
+
+    let file_buffer = mmap_read(&file);
+
+    let map = parse(file_buffer.buffer);
+
+    print_sorted(&map);
+}
+
