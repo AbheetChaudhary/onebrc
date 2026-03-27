@@ -1,25 +1,12 @@
-#![allow(unused)]
-#![feature(cold_path)]
+#![feature(allocator_api)]
 
-use std::collections::{
-    BTreeMap,
-    HashMap,
-};
-use std::io::{
-    BufWriter,
-    Write,
-    Read,
-};
+mod alloc;
+use alloc::CityAllocator;
 
-use std::time;
-
-use core::arch::x86_64::*;
-
-#[inline(never)]
-#[unsafe(no_mangle)]
-unsafe extern "C" fn bcmp(s1: *const u8, s2: *const u8, size: usize) -> i32 {
-    unsafe { libc::memcmp(s1 as *const _, s2 as *const _, size) }
-}
+use std::alloc::{Allocator, Layout};
+use std::cell::LazyCell;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufWriter, Write};
 
 fn reading_from_str(bytes: &[u8]) -> i16 {
     let len = bytes.len();
@@ -82,23 +69,30 @@ impl Record {
     }
 }
 
-struct CityHashBuilder;
 
-impl std::hash::BuildHasher for CityHashBuilder {
-    type Hasher = CityHasher;
+thread_local! {
+    static CITY_ALLOCATOR: LazyCell<CityAllocator> = LazyCell::new(|| {
+        CityAllocator::new()
+    });
+}
+
+struct HashBuilder;
+
+impl std::hash::BuildHasher for HashBuilder {
+    type Hasher = FNV1Hasher;
 
     fn build_hasher(&self) -> Self::Hasher {
-        CityHasher {
+        FNV1Hasher {
             state: 0xcbf29ce484222325,
         }
     }
 }
 
-struct CityHasher {
+struct FNV1Hasher {
     state: u64,
 }
 
-impl std::hash::Hasher for CityHasher {
+impl std::hash::Hasher for FNV1Hasher {
     fn finish(&self) -> u64 {
         self.state
     }
@@ -112,119 +106,54 @@ impl std::hash::Hasher for CityHasher {
 }
 
 #[repr(transparent)]
-struct CityName<'a> {
-    name: &'a [u8],
+#[derive(Hash, PartialEq, Eq)]
+struct City {
+    name: Vec<u8>, // TODO: it does not need to be vector, could be something
+                   // smaller.
 }
 
-impl<'a> PartialEq for CityName<'a> {
-    fn eq(&self, other: &CityName) -> bool {
-        if self.name.len() != other.name.len() {
-            return false;
-        }
+impl City {
+    // Create a new City from a given byte slice. The slice will be coming from
+    // mmap'ed file, whose owned copy will be stored. The underlying memory
+    // comes from an allocator designed to keep all the city names memory together.
+    fn from(name: &[u8]) -> Self {
+        let len = name.len();
 
-        let len = self.name.len();
+        let layout = Layout::array::<u8>(len).unwrap();
 
-        unsafe {
-            libc::memcmp(self.name.as_ptr() as _, other.name.as_ptr() as _, len) == 0
-        }
-    }
-}
+        // Allocate memory to hold the city name.
+        let mut ptr = CITY_ALLOCATOR.with(|city_allocator| {
+            city_allocator.allocate(layout)
+        }).unwrap().cast::<u8>();
 
-impl<'a> Eq for CityName<'a> {}
+        // Copy from disk to newly allocated memory.
+        unsafe { ptr.as_ptr().copy_from_nonoverlapping(name.as_ptr(), len); }
 
-impl<'a> std::hash::Hash for CityName<'a> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let ptr = self.name.as_ptr();
+        let vec = unsafe {
+            Vec::from_raw_parts(
+                ptr.as_mut(),
+                len,
+                len,
+            )
+        };
 
-        match self.name.len() {
-            0..16 => {
-                // Less than 16 bytes
-                state.write(&self.name);
-            }
-
-            16..32 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                state.write(&self.name[16..]);
-            }
-
-            32..48 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(16).cast() });
-                state.write(&self.name[32..]);
-            }
-
-            48..64 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(16).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(32).cast() });
-                state.write(&self.name[48..]);
-            }
-
-            64..80 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(16).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(32).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(48).cast() });
-                state.write(&self.name[64..]);
-            }
-
-            80..96 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(16).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(32).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(48).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(64).cast() });
-                state.write(&self.name[80..]);
-            }
-
-            96..=100 => {
-                // First 16 bytes
-                state.write_u128(unsafe { *ptr.cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(16).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(32).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(48).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(64).cast() });
-                // Next 16 bytes
-                state.write_u128(unsafe { *ptr.add(80).cast() });
-                state.write(&self.name[96..]);
-            }
-
-            _ => unreachable!(),
+        Self {
+            name: vec,
         }
     }
 }
 
+impl Drop for City {
+    fn drop(&mut self) {
+        // The vector's memory comes from CityAllocator which is a bump
+        // allocator, so do not try to drop it.
+        std::mem::forget(std::mem::replace(&mut self.name, Vec::default()));
+    }
+}
 
-/*
-impl<'a> std::borrow::Borrow<[u8]> for CityName<'a> {
+impl std::borrow::Borrow<[u8]> for City {
     fn borrow(&self) -> &[u8] {
-        self.name
-    }
-}
-*/
-
-impl<'a> CityName<'a> {
-    fn from(name: &'a [u8]) -> Self {
-        CityName { name }
+        self.name.as_slice()
     }
 }
 
@@ -245,23 +174,23 @@ fn main() {
     let read_buffer_ptr: *const u8 = file_buffer.buffer.as_ptr();
     let read_buffer_size = file_buffer.buffer.len();
 
-    let mut map: HashMap<CityName, Record, CityHashBuilder> =
-        HashMap::with_capacity_and_hasher(10000, CityHashBuilder);
+    let mut map: HashMap<City, Record, HashBuilder> =
+        HashMap::with_capacity_and_hasher(10000, HashBuilder);
 
+    // Index of the next byte to process in the mmap'ed file.
     let mut begin_idx = 0;
 
     loop {
+        let begin_ptr = unsafe { read_buffer_ptr.add(begin_idx) };
         let semicolon_ptr = unsafe {
             libc::memchr(
-                read_buffer_ptr.add(begin_idx) as *const _,
+                begin_ptr as *const _,
                 b';' as _,
                 read_buffer_size - begin_idx,
             )
         } as *const u8;
 
-        let city_name_len: usize = unsafe {
-            semicolon_ptr.addr() - read_buffer_ptr.add(begin_idx).addr()
-        };
+        let city_name_len: usize = semicolon_ptr.addr() - begin_ptr.addr();
 
         let newline_ptr = unsafe {
             libc::memchr(
@@ -276,7 +205,7 @@ fn main() {
 
         let city = unsafe {
             std::slice::from_raw_parts(
-                read_buffer_ptr.add(begin_idx),
+                begin_ptr,
                 city_name_len,
             )
         };
@@ -290,12 +219,17 @@ fn main() {
 
         let temperature = reading_from_str(temperature_bytes);
 
-        map.entry(CityName::from(city)).and_modify(|e| e.update(temperature))
-            .or_insert(Record::new(temperature));
+        match map.get_mut(city) {
+            Some(v) => {
+                v.update(temperature);
+            }
+            None => {
+                let city_name = City::from(city);
+                _ = map.insert(city_name, Record::new(temperature));
+            }
+        }
 
-        begin_idx = unsafe {
-            newline_ptr.add(1).addr() - read_buffer_ptr.addr()
-        } as usize;
+        begin_idx = newline_ptr.addr() + 1 - read_buffer_ptr.addr();
 
         if begin_idx == read_buffer_size {
             break;
@@ -306,7 +240,7 @@ fn main() {
 
     let data_btree: BTreeMap<&[u8], &Record> =
         BTreeMap::from_iter(map.iter().map(|(city, record)| {
-            (city.name, record)
+            (city.name.as_slice(), record)
         }));
 
     for (city, entry) in &data_btree {

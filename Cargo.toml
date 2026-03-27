@@ -7,6 +7,6 @@ edition = "2024"
 libc = "0.2.178"
 
 [profile.release]
-lto = "fat"
+# lto = "fat"
 debug = true
 codegen-units = 1
