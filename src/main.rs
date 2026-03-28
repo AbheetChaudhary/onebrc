@@ -306,8 +306,17 @@ impl CitySlice {
 
 impl Hash for CitySlice {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.len.hash(state);
-        self.as_slice()[..15].hash(state);
+        let ptr = self.ptr;
+        let len = self.len;
+
+        unsafe {
+            let first = (ptr as *const u128).read_unaligned();
+            let last = (ptr.add(len - 16) as *const u128).read_unaligned();
+
+            state.write_u128(last);
+            state.write_usize(len);
+            state.write_u128(first);
+        }
     }
 }
 
