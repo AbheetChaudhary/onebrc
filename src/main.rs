@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::mem::MaybeUninit;
 use std::hash::{Hasher, Hash};
-use fxhash::FxHashMap;
+use ahash::AHashMap;
 
 mod alloc {
     use std::alloc::{Allocator, Layout, AllocError};
@@ -112,6 +112,7 @@ fn reading_from_str(bytes: &[u8]) -> i16 {
     }
 }
 
+#[derive(Copy, Clone)]
 struct Record {
     min:   i16, // current minimum scaled temperature
     max:   i16, // current maximum scaled temperature
@@ -126,6 +127,15 @@ impl Record {
             max: val,
             count: 1,
             sum: val as _,
+        }
+    }
+
+    const fn default() -> Self {
+        Self {
+            min: i16::MAX,
+            max: i16::MIN,
+            count: 0,
+            sum: 0,
         }
     }
 
@@ -310,12 +320,12 @@ impl Hash for CitySlice {
         let len = self.len;
 
         unsafe {
-            let first = (ptr as *const u128).read_unaligned();
-            let last = (ptr.add(len - 16) as *const u128).read_unaligned();
+            let first = (ptr as *const u64).read_unaligned();
+            let last = (ptr.add(len - 8) as *const u64).read_unaligned();
 
-            state.write_u128(last);
+            state.write_u64(last);
             state.write_usize(len);
-            state.write_u128(first);
+            state.write_u64(first);
         }
     }
 }
@@ -328,15 +338,15 @@ impl PartialEq for CitySlice {
 
 impl Eq for CitySlice {}
 
-fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySlice, Record>) {
+fn parse(read_buffer: &[u8]) -> (AHashMap<CityInline, Record>, Vec<(CitySlice, Record)>) {
     let read_buffer_ptr: *const u8 = read_buffer.as_ptr();
     let read_buffer_size = read_buffer.len();
 
-    let mut map_inlined: FxHashMap<CityInline, Record> = 
-        FxHashMap::with_capacity_and_hasher(65536, fxhash::FxBuildHasher::new());
+    let mut map_inlined: AHashMap<CityInline, Record> = 
+        AHashMap::with_capacity(65536);
 
-    let mut map_sliced: FxHashMap<CitySlice, Record> = 
-        FxHashMap::with_capacity_and_hasher(65536, fxhash::FxBuildHasher::new());
+    let mut vec_sliced: Vec<(u64, Record, Option<CitySlice>)> =
+        vec![(0, Record::default(), None); 65536 * 2];
 
     // Index of the next byte to process in the mmap'ed file.
     let mut begin_idx = 0;
@@ -388,24 +398,40 @@ fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySl
                 len: city_name_len,
             };
 
-            match map_sliced.get_mut(&city) {
-                Some(v) => {
-                    v.update(temperature);
-                }
-                None => {
-                    std::hint::cold_path();
+            let s = ahash::RandomState::with_seeds(0x112233, 0xcb84222325, 
+                0x1b3, 0xcafef0d);
 
-                    // This allocates using CityAllocator.
-                    let city_name = CitySlice::from(city.as_slice());
-                    _ = map_sliced.insert(city_name, Record::new(temperature));
+            let hash = s.hash_one(city);
+
+            let idx = hash as u16;
+
+            let idx = idx as usize;
+
+            if vec_sliced[idx as usize].0 != 0 {
+                if vec_sliced[idx].0 == hash {
+                    vec_sliced[idx].1.update(temperature);
+                } else {
+                    std::hint::cold_path();
+                    if vec_sliced[idx + 65536].0 != 0 {
+                        if vec_sliced[idx + 65536].0 == hash {
+                            vec_sliced[idx + 65536].1.update(temperature);
+                        } else {
+                            panic!("triple collision!");
+                        }
+                    } else {
+                        std::hint::cold_path();
+                        vec_sliced[idx + 65536].0 = hash;
+                        vec_sliced[idx + 65536].1.update(temperature);
+                        vec_sliced[idx + 65536].2 = Some(CitySlice::from(city.as_slice()));
+                    }
                 }
+            } else {
+                std::hint::cold_path();
+                vec_sliced[idx].0 = hash;
+                vec_sliced[idx].1.update(temperature);
+                vec_sliced[idx].2 = Some(CitySlice::from(city.as_slice()));
             }
         };
-
-        /*
-        map.entry(city).and_modify(|record| record.update(temperature))
-            .or_insert(Record::new(temperature));
-        */
 
         begin_idx += city_name_len + 1 + temp_len + 1;
 
@@ -414,10 +440,15 @@ fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySl
         }
     }
 
-    (map_inlined, map_sliced)
+    let vec_sliced: Vec<(CitySlice, Record)> = vec_sliced.into_iter()
+        .filter(|(hash, _, _)| *hash != 0)
+        .map(|(_, record, opt_city)| (opt_city.unwrap(), record))
+        .collect();
+
+    (map_inlined, vec_sliced)
 }
 
-fn print_sorted_slice(map: &FxHashMap<CitySlice, Record>) {
+fn print_sorted_slice(map: &Vec<(CitySlice, Record)>) {
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
     let data_btree: BTreeMap<&[u8], &Record> =
@@ -440,7 +471,7 @@ fn print_sorted_slice(map: &FxHashMap<CitySlice, Record>) {
     _ = writer.flush();
 }
 
-fn print_sorted_inlined(map: &FxHashMap<CityInline, Record>) {
+fn print_sorted_inlined(map: &AHashMap<CityInline, Record>) {
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
     let data_btree: BTreeMap<&[u8], &Record> =
@@ -530,10 +561,36 @@ fn main() {
 
     let file_buffer = mmap_read(&file);
 
-    let (map_inlined, map_slice) = parse(file_buffer.buffer);
+    let (map_inlined, vec_sliced) = parse(file_buffer.buffer);
 
     print_sorted_inlined(&map_inlined);
-    print_sorted_slice(&map_slice);
-}
+    print_sorted_slice(&vec_sliced);
 
+    /*
+    let cities: Vec<Vec<u8>> = map_inlined.keys().map(|k| k.as_slice().to_owned()).collect();
+
+    let mut hashes: Vec<Vec<u64>> = vec![vec![]; 65536 * 2];
+
+    for city in &cities {
+        let s = ahash::RandomState::with_seeds(0x112233, 0xcb84222325, 0x1b3, 0xcafef0d);
+        let hash = s.hash_one(city);
+        // println!("hash: 0x{:x}", hash);
+        let idx = hash as u16;
+        hashes[idx as usize].push(hash);
+        /*
+        if hashes[idx as usize].is_empty() {
+            hashes[idx as usize].push(hash);
+        } else {
+            hashes[idx as usize + 65536].push(hash);
+        }
+        */
+    }
+
+    for (idx, collisions) in hashes.iter().enumerate() {
+        if collisions.len() > 2 {
+            println!("collisions({idx}): {:?}", collisions);
+        }
+    }
+    */
+}
 
