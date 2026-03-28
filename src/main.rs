@@ -241,7 +241,13 @@ impl CityInline {
         let ptr_to_len = unsafe { ptr_to_bytes.add(15) };
 
         unsafe {
-            ptr_to_bytes.copy_from_nonoverlapping(ptr, len);
+            // ptr_to_bytes.copy_from_nonoverlapping(ptr, len);
+            let mut val = (ptr as *const u128).read_unaligned();
+
+            let mask = (!0u128) >> ((16 - len) * 8);
+            val &= mask;
+
+            (ptr_to_bytes as *mut u128).write_unaligned(val);
             ptr_to_len.write(len as u8);
         }
 
@@ -318,10 +324,10 @@ fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySl
     let read_buffer_size = read_buffer.len();
 
     let mut map_inlined: FxHashMap<CityInline, Record> = 
-        FxHashMap::with_capacity_and_hasher(10000, fxhash::FxBuildHasher::new());
+        FxHashMap::with_capacity_and_hasher(65536, fxhash::FxBuildHasher::new());
 
     let mut map_sliced: FxHashMap<CitySlice, Record> = 
-        FxHashMap::with_capacity_and_hasher(10000, fxhash::FxBuildHasher::new());
+        FxHashMap::with_capacity_and_hasher(65536, fxhash::FxBuildHasher::new());
 
     // Index of the next byte to process in the mmap'ed file.
     let mut begin_idx = 0;
@@ -359,16 +365,19 @@ fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySl
         if city_name_len < 16 {
             let city = CityInline::from(begin_ptr, city_name_len);
 
-            map_inlined.entry(city).and_modify(|record| record.update(temperature))
-                .or_insert(Record::new(temperature));
+            match map_inlined.get_mut(&city) {
+                Some(v) => v.update(temperature),
+                None => {
+                    std::hint::cold_path();
+                    _ = map_inlined.insert(city, Record::new(temperature));
+                }
+            }
         } else {
+            std::hint::cold_path();
             let city = CitySlice {
                 ptr: begin_ptr,
                 len: city_name_len,
             };
-
-            // map_sliced.entry(city).and_modify(|record| record.update(temperature))
-            //     .or_insert(Record::new(temperature));
 
             match map_sliced.get_mut(&city) {
                 Some(v) => {
@@ -517,4 +526,5 @@ fn main() {
     print_sorted_inlined(&map_inlined);
     print_sorted_slice(&map_slice);
 }
+
 
