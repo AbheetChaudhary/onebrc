@@ -2,10 +2,11 @@
 
 use std::alloc::{Allocator, Layout};
 use std::cell::LazyCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
-
+use std::mem::MaybeUninit;
 use std::hash::{Hasher, Hash};
+use fxhash::FxHashMap;
 
 mod alloc {
     use std::alloc::{Allocator, Layout, AllocError};
@@ -136,6 +137,7 @@ impl Record {
     }
 }
 
+/*
 struct HashBuilder;
 
 impl std::hash::BuildHasher for HashBuilder {
@@ -164,18 +166,114 @@ impl std::hash::Hasher for FNV1Hasher {
         }
     }
 }
+*/
 
-struct City {
+/*
+union City {
+    inline: CityInline,
+    slice: CitySlice,
+}
+
+impl PartialEq for City {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for City {}
+
+impl City {
+    fn from_inline(ptr: *const u8, len: usize) -> Self {
+        City {
+            inline: CityInline::from(ptr, len),
+        }
+    }
+
+    fn from_slice(slice: &[u8]) -> Self {
+        City {
+            slice: CitySlice::from(slice),
+        }
+    }
+
+    fn is_inline(&self) -> bool {
+        let len_ptr = unsafe { ((&raw const self.inline) as *const u8).add(15) };
+
+        unsafe { len_ptr.read() != 0 }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.is_inline() {
+            unsafe { self.inline.as_slice() }
+        } else {
+            unsafe { self.slice.as_slice() }
+        }
+    }
+}
+
+impl Hash for City {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if self.is_inline() {
+            (unsafe { self.inline }).hash(state);
+        } else {
+            (unsafe { self.slice }).hash(state);
+        }
+    }
+}
+*/
+
+#[repr(C)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct CityInline {
+    inlined: [u8; 16],
+}
+
+impl Hash for CityInline {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inlined.hash(state);
+    }
+}
+
+impl CityInline {
+    fn from(ptr: *const u8, len: usize) -> Self {
+        // assert!(len < 16 && len > 0);
+        let mut uninit: MaybeUninit<[u8; 16]> = MaybeUninit::zeroed();
+        let ptr_to_bytes = uninit.as_mut_ptr().cast::<u8>();
+        let ptr_to_len = unsafe { ptr_to_bytes.add(15) };
+
+        unsafe {
+            ptr_to_bytes.copy_from_nonoverlapping(ptr, len);
+            ptr_to_len.write(len as u8);
+        }
+
+        CityInline {
+            inlined: unsafe {
+                uninit.assume_init()
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        let len = self.inlined[15];
+        unsafe {
+            std::slice::from_raw_parts(&self.inlined as *const _, len as usize)
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CitySlice {
     ptr: *const u8,
     len: usize,
 }
 
-impl City {
-    // Create a new City from a given byte slice. The slice will be coming from
+impl CitySlice {
+    // Create a new CitySlice from a given byte slice. The slice will be coming from
     // mmap'ed file, whose owned copy will be stored. The underlying memory
     // comes from an allocator designed to keep all the city names memory together.
     fn from(name: &[u8]) -> Self {
         let len = name.len();
+        // assert!(len >= 16);
 
         let layout = Layout::array::<u8>(len).unwrap();
 
@@ -192,111 +290,144 @@ impl City {
             len,
         }
     }
-}
 
-impl std::ops::Deref for City {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self.ptr, self.len)
+        }
     }
 }
 
-impl Hash for City {
+impl Hash for CitySlice {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (&self[..]).hash(state);
+        self.len.hash(state);
+        self.as_slice()[..15].hash(state);
     }
 }
 
-impl PartialEq for City {
+impl PartialEq for CitySlice {
     fn eq(&self, other: &Self) -> bool {
-        &self[..] == &other[..]
+        self.as_slice() == other.as_slice()
     }
 }
 
-impl Eq for City {}
+impl Eq for CitySlice {}
 
-impl std::borrow::Borrow<[u8]> for City {
-    fn borrow(&self) -> &[u8] {
-        &self[..]
-    }
-}
-
-fn parse(read_buffer: &[u8]) -> HashMap<City, Record, HashBuilder> {
+fn parse(read_buffer: &[u8]) -> (FxHashMap<CityInline, Record>, FxHashMap<CitySlice, Record>) {
     let read_buffer_ptr: *const u8 = read_buffer.as_ptr();
     let read_buffer_size = read_buffer.len();
 
-    let mut map: HashMap<City, Record, HashBuilder> =
-        HashMap::with_capacity_and_hasher(10000, HashBuilder);
+    let mut map_inlined: FxHashMap<CityInline, Record> = 
+        FxHashMap::with_capacity_and_hasher(10000, fxhash::FxBuildHasher::new());
+
+    let mut map_sliced: FxHashMap<CitySlice, Record> = 
+        FxHashMap::with_capacity_and_hasher(10000, fxhash::FxBuildHasher::new());
 
     // Index of the next byte to process in the mmap'ed file.
     let mut begin_idx = 0;
 
     loop {
         let begin_ptr = unsafe { read_buffer_ptr.add(begin_idx) };
-        let semicolon_ptr = unsafe {
+        let semi_ptr = unsafe {
             libc::memchr(
                 begin_ptr as *const _,
                 b';' as _,
-                read_buffer_size - begin_idx,
+                104,
             )
         } as *const u8;
 
-        let city_name_len: usize = semicolon_ptr.addr() - begin_ptr.addr();
+        let (x, y) = unsafe {
+            (semi_ptr.add(4).read(), semi_ptr.add(5).read())
+        };
 
-        let newline_ptr = unsafe {
-            libc::memchr(
-                semicolon_ptr.add(1) as *const _,
-                b'\n' as _,
-                read_buffer_size - begin_idx - city_name_len,
-            )
-        } as *const u8;
-
-        let temperature_bytes_len =
-            newline_ptr.addr() - semicolon_ptr.addr() - 1;
-
-        let city = unsafe {
-            std::slice::from_raw_parts(
-                begin_ptr,
-                city_name_len,
-            )
+        let temp_len = if x == b'\n' {
+            3
+        } else if y == b'\n' {
+            4
+        } else {
+            5
         };
 
         let temperature_bytes = unsafe {
-            std::slice::from_raw_parts(
-                semicolon_ptr.add(1),
-                temperature_bytes_len
-            )
+            std::slice::from_raw_parts(semi_ptr.add(1), temp_len)
         };
 
         let temperature = reading_from_str(temperature_bytes);
 
-        match map.get_mut(city) {
-            Some(v) => {
-                v.update(temperature);
-            }
-            None => {
-                let city_name = City::from(city);
-                _ = map.insert(city_name, Record::new(temperature));
-            }
-        }
+        let city_name_len: usize = semi_ptr.addr() - begin_ptr.addr();
 
-        begin_idx = newline_ptr.addr() + 1 - read_buffer_ptr.addr();
+        if city_name_len < 16 {
+            let city = CityInline::from(begin_ptr, city_name_len);
+
+            map_inlined.entry(city).and_modify(|record| record.update(temperature))
+                .or_insert(Record::new(temperature));
+        } else {
+            let city = CitySlice {
+                ptr: begin_ptr,
+                len: city_name_len,
+            };
+
+            // map_sliced.entry(city).and_modify(|record| record.update(temperature))
+            //     .or_insert(Record::new(temperature));
+
+            match map_sliced.get_mut(&city) {
+                Some(v) => {
+                    v.update(temperature);
+                }
+                None => {
+                    std::hint::cold_path();
+
+                    // This allocates using CityAllocator.
+                    let city_name = CitySlice::from(city.as_slice());
+                    _ = map_sliced.insert(city_name, Record::new(temperature));
+                }
+            }
+        };
+
+        /*
+        map.entry(city).and_modify(|record| record.update(temperature))
+            .or_insert(Record::new(temperature));
+        */
+
+        begin_idx += city_name_len + 1 + temp_len + 1;
 
         if begin_idx == read_buffer_size {
             break;
         }
     }
 
-    map
+    (map_inlined, map_sliced)
 }
 
-fn print_sorted(map: &HashMap<City, Record, HashBuilder>) {
+fn print_sorted_slice(map: &FxHashMap<CitySlice, Record>) {
     let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
 
     let data_btree: BTreeMap<&[u8], &Record> =
         BTreeMap::from_iter(map.iter().map(|(city, record)| {
-            (&city[..], record)
+            (city.as_slice(), record)
+        }));
+
+    for (city, entry) in &data_btree {
+        _ = writer.write(
+            format!(
+                "{}: {:.1}, {:.1}, {:.1}\n",
+                unsafe { str::from_utf8_unchecked(city) },
+                entry.min as f32 / 10.0,
+                entry.max as f32 / 10.0,
+                entry.sum as f64 / entry.count as f64 / 10.0,
+            ).as_bytes()
+        );
+    }
+
+    _ = writer.flush();
+}
+
+fn print_sorted_inlined(map: &FxHashMap<CityInline, Record>) {
+    let mut writer = BufWriter::with_capacity(512 * 1024 * 1024, std::io::stdout());
+
+    let data_btree: BTreeMap<&[u8], &Record> =
+        BTreeMap::from_iter(map.iter().map(|(city, record)| {
+            (city.as_slice(), record)
         }));
 
     for (city, entry) in &data_btree {
@@ -381,8 +512,9 @@ fn main() {
 
     let file_buffer = mmap_read(&file);
 
-    let map = parse(file_buffer.buffer);
+    let (map_inlined, map_slice) = parse(file_buffer.buffer);
 
-    print_sorted(&map);
+    print_sorted_inlined(&map_inlined);
+    print_sorted_slice(&map_slice);
 }
 
